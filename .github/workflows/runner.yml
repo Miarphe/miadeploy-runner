@@ -1,0 +1,23 @@
+name: runner
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+concurrency:
+  group: miadeploy-runner
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node runner/runner.mjs
+        env:
+          HUB_URL: ${{ secrets.HUB_URL }}
+          RUNNER_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+          RUNNER_KIND: gha
+          RUNNER_SLOTS: "3"
