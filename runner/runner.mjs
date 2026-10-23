@@ -8,12 +8,21 @@ const HUBS = (process.env.HUB_URL || "").split(/[\s,]+/).map((s) => s.trim().rep
 let HUB = HUBS[0] || "";
 const TOKEN = process.env.RUNNER_TOKEN || "";
 const TAGS = (process.env.RUNNER_TAGS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-const SLOTS = Math.max(1, Math.min(8, Number(process.env.RUNNER_SLOTS) || 3));
+const SLOTS = Math.max(1, Math.min(32, Number(process.env.RUNNER_SLOTS) || 3));
+const SLOT = Math.max(0, Math.min(99, Number(process.env.RUNNER_SLOT) || 0));
+const FLEET = SLOT > 0;
 const KIND = process.env.RUNNER_KIND || "vps";
 const GHA = KIND === "gha";
 const MAX_MS = (Number(process.env.RUNNER_MAX_MINUTES) || (GHA ? 330 : 0)) * 60000;
 const EVENT = process.env.GITHUB_EVENT_NAME || "";
-const ID = KIND + "-" + Math.random().toString(36).slice(2, 8);
+const ID = KIND + (FLEET ? "-s" + SLOT : "") + "-" + Math.random().toString(36).slice(2, 8);
+const STARTED_FILE = "/tmp/mia_started";
+const NORESPAWN_FILE = "/tmp/mia_norespawn";
+const flag = (f) => { try { writeFileSync(f, String(Date.now())); } catch {} };
+let SHUTDOWN = false;
+let staleSeen = false;
+const active = new Map();
+function abortAll() { SHUTDOWN = true; for (const a of active.values()) a.abort(); }
 
 if (!HUB || !TOKEN) { console.error("HUB_URL and RUNNER_TOKEN are required."); process.exit(2); }
 
@@ -83,6 +92,7 @@ function prepare(c) {
 async function runJob(c) {
   const job = c.job;
   const ac = new AbortController();
+  active.set(job.id, ac);
   let buf = "";
   const out = (...a) => {
     const line = a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
@@ -90,7 +100,7 @@ async function runJob(c) {
     console.log("[" + job.name + "]", line);
   };
   const beat = setInterval(async () => {
-    try { const r = await hub("beat", { job: job.id, log: buf }, 15000); if (r.cancel) ac.abort(); } catch (e) { if (e.status === 401) ac.abort(); }
+    try { const r = await hub("beat", { job: job.id, log: buf }, 15000); if (r.stale) staleSeen = true; if (r.cancel) ac.abort(); } catch (e) { if (e.status === 401) ac.abort(); }
   }, 20000);
   let res;
   try {
@@ -108,7 +118,11 @@ async function runJob(c) {
     res = { ok: true, result: result === undefined ? null : result };
   } catch (e) {
     res = { ok: false, error: String(e && e.stack ? e.stack : e).slice(0, 4000) };
-  } finally { clearInterval(beat); }
+  } finally { clearInterval(beat); active.delete(job.id); }
+  if (SHUTDOWN && !res.ok) {
+    for (let i = 0; i < 3; i++) { try { await hub("release", { job: job.id }, 8000); break; } catch { await sleep(800); } }
+    return;
+  }
   for (let i = 0; i < 4; i++) {
     try { await hub("done", { job: job.id, log: buf, ...res }); break; } catch (e) { if (i === 3) log("could not report", job.id, e.message); else await sleep(3000 * (i + 1)); }
   }
@@ -116,41 +130,64 @@ async function runJob(c) {
 
 let cfg = null;
 let lastErr = "";
-for (let round = 0; round < 4 && !cfg; round++) {
+const bootEnd = Date.now() + 20 * 60000;
+for (let round = 0; !cfg && (FLEET ? Date.now() < bootEnd : round < 4); round++) {
   let rejected = 0;
   for (const h of HUBS) {
     HUB = h;
-    try { cfg = await hub("hello", { tags: TAGS, kind: KIND, slots: SLOTS, event: EVENT }, 25000); break; } catch (e) {
+    try { cfg = await hub("hello", { tags: TAGS, kind: KIND, slots: SLOTS, event: EVENT, slot: SLOT, epoch: Number(process.env.RUNNER_EPOCH) || 0 }, 25000); break; } catch (e) {
       lastErr = h + " " + e.message;
       if (e.status === 401) rejected++; else log("hub", h, "is not answering:", e.message);
     }
   }
-  if (!cfg && rejected === HUBS.length) { log("The runner token was rejected."); process.exit(3); }
-  if (!cfg && round < 3) await sleep(4000 * (round + 1));
+  if (!cfg && rejected === HUBS.length) { log("The runner token was rejected."); if (FLEET) flag(NORESPAWN_FILE); process.exit(3); }
+  if (!cfg && (FLEET || round < 3)) await sleep(FLEET ? Math.min(60000, 5000 * (round + 1)) : 4000 * (round + 1));
 }
 if (!cfg) { log("Hub unreachable:", lastErr); process.exit(1); }
+if (cfg.stale) { log("This start was replaced by a newer one, exiting."); flag(NORESPAWN_FILE); process.exit(0); }
+if (cfg.reconcile) { log("Reconcile run, the hub restarted any missing slot."); process.exit(0); }
 if (HUBS.length > 1) log("using hub", HUB);
-log("runner", ID, "online", KIND, "slots", SLOTS, "tags", TAGS.join(",") || "none", "keepAlive", cfg.keepAlive);
+const startedAt = Date.now();
+const DEADLINE = FLEET ? Number(cfg.deadline) || startedAt + 300 * 60000 : 0;
+const HARD = FLEET ? Math.min(DEADLINE + 15 * 60000, startedAt + 345 * 60000) : 0;
+flag(STARTED_FILE);
+log("runner", ID, "online", KIND, "slots", SLOTS, "tags", TAGS.join(",") || "none", "keepAlive", cfg.keepAlive, FLEET ? "slot " + SLOT + " until " + new Date(DEADLINE).toISOString() : "");
 
 let running = 0;
 let stopping = false;
 let lastBusy = Date.now();
 let lastTick = 0;
-const startedAt = Date.now();
+
+async function shutdown(why) {
+  if (SHUTDOWN) return;
+  stopping = true;
+  log(why);
+  abortAll();
+  const t = Date.now();
+  while (running > 0 && Date.now() - t < 6000) await sleep(200);
+  process.exit(0);
+}
+process.on("SIGTERM", () => shutdown("SIGTERM received, releasing jobs"));
+process.on("SIGINT", () => shutdown("SIGINT received, releasing jobs"));
 
 while (true) {
-  if (!stopping && MAX_MS && Date.now() - startedAt > MAX_MS) { stopping = true; log("lifetime reached, draining"); }
+  const now = Date.now();
+  if (staleSeen && !SHUTDOWN) { flag(NORESPAWN_FILE); await shutdown("This start was replaced by a newer one, releasing jobs."); }
+  if (!stopping && FLEET && now >= DEADLINE) { stopping = true; log("lifetime reached, draining"); }
+  else if (!stopping && !FLEET && MAX_MS && now - startedAt > MAX_MS) { stopping = true; log("lifetime reached, draining"); }
   if (stopping && running === 0) break;
-  if (GHA && !cfg.keepAlive && running === 0 && Date.now() - lastBusy > cfg.idleSeconds * 1000) { log("idle, exiting"); break; }
-  if (Date.now() - lastTick > 240000) { lastTick = Date.now(); hub("tick", {}, 320000).catch(() => {}); }
+  if (stopping && FLEET && !SHUTDOWN && now >= HARD) { log("drain limit reached, releasing the rest"); abortAll(); }
+  if (!FLEET && GHA && !cfg.keepAlive && running === 0 && now - lastBusy > cfg.idleSeconds * 1000) { log("idle, exiting"); break; }
+  if (now - lastTick > (FLEET ? 60000 : 240000)) { lastTick = now; hub("tick", {}, 320000).then((r) => { if (r && r.stale) staleSeen = true; }).catch(() => {}); }
   if (stopping || running >= SLOTS) { await sleep(1000); continue; }
   let c;
   try { c = await hub("claim", { tags: TAGS, wait: 20000, busy: running }, 40000); } catch (e) {
-    if (e.status === 401) { log("The runner token was rejected."); process.exit(3); }
+    if (e.status === 401) { if (FLEET) { log("The runner token was rejected, ending this start."); stopping = true; continue; } log("The runner token was rejected."); process.exit(3); }
     log("claim error:", e.message);
     await sleep(5000);
     continue;
   }
+  if (c.stale) { staleSeen = true; continue; }
   if (!c.job) continue;
   lastBusy = Date.now();
   running++;
