@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const HUB = (process.env.HUB_URL || "").replace(/\/$/, "");
+const HUBS = (process.env.HUB_URL || "").split(/[\s,]+/).map((s) => s.trim().replace(/\/+$/, "")).filter(Boolean);
+let HUB = HUBS[0] || "";
 const TOKEN = process.env.RUNNER_TOKEN || "";
 const TAGS = (process.env.RUNNER_TAGS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 const SLOTS = Math.max(1, Math.min(8, Number(process.env.RUNNER_SLOTS) || 3));
@@ -113,14 +114,22 @@ async function runJob(c) {
   }
 }
 
-let cfg = { keepAlive: false, idleSeconds: 240 };
-for (let i = 0; ; i++) {
-  try { cfg = await hub("hello", { tags: TAGS, kind: KIND, slots: SLOTS, event: EVENT }); break; } catch (e) {
-    if (e.status === 401) { log("The runner token was rejected."); process.exit(3); }
-    if (i >= 5) { log("Hub unreachable:", e.message); process.exit(1); }
-    await sleep(4000 * (i + 1));
+let cfg = null;
+let lastErr = "";
+for (let round = 0; round < 4 && !cfg; round++) {
+  let rejected = 0;
+  for (const h of HUBS) {
+    HUB = h;
+    try { cfg = await hub("hello", { tags: TAGS, kind: KIND, slots: SLOTS, event: EVENT }, 25000); break; } catch (e) {
+      lastErr = h + " " + e.message;
+      if (e.status === 401) rejected++; else log("hub", h, "is not answering:", e.message);
+    }
   }
+  if (!cfg && rejected === HUBS.length) { log("The runner token was rejected."); process.exit(3); }
+  if (!cfg && round < 3) await sleep(4000 * (round + 1));
 }
+if (!cfg) { log("Hub unreachable:", lastErr); process.exit(1); }
+if (HUBS.length > 1) log("using hub", HUB);
 log("runner", ID, "online", KIND, "slots", SLOTS, "tags", TAGS.join(",") || "none", "keepAlive", cfg.keepAlive);
 
 let running = 0;
