@@ -111,7 +111,8 @@ async function runJob(c) {
     const fn = mod.default || mod.run;
     if (typeof fn !== "function") throw new Error("jobs/" + job.name + ".mjs must export a default function.");
     const mia = makeMia(HUB, c.key);
-    const work = Promise.resolve(fn(job.payload, { mia, log: out, signal: ac.signal, job: { id: job.id, name: job.name, attempt: job.attempts, project: c.project } }));
+    const hubCall = (act, body = {}, ms = 120000) => hub("blobs", { job: job.id, act, ...body }, ms);
+    const work = Promise.resolve(fn(job.payload, { mia, hub: hubCall, log: out, signal: ac.signal, job: { id: job.id, name: job.name, attempt: job.attempts, project: c.project } }));
     const timer = new Promise((_, rej) => setTimeout(() => { rej(new Error("Timed out after " + job.timeout_s + "s.")); ac.abort(); }, job.timeout_s * 1000));
     const stop = new Promise((_, rej) => ac.signal.addEventListener("abort", () => rej(new Error("Canceled.")), { once: true }));
     const result = await Promise.race([work, timer, stop]);
